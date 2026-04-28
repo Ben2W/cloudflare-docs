@@ -1,36 +1,59 @@
 ---
 title: Dynamic Workflows
-description: Create and run Workflow logic dynamically while keeping Workflow steps durable.
+description: Run different Workflow logic for each user or tenant by combining Workflows with Dynamic Workers.
 pcx_content_type: example
 sidebar:
   order: 3
 ---
 
-import { TypeScriptExample, WranglerConfig } from "~/components";
+import {
+	PackageManagers,
+	TypeScriptExample,
+	WranglerConfig,
+} from "~/components";
 
-Use this pattern when your workflow logic is not known at deploy time, but you still need Workflow durability. In this example, we implement a simple Dynamic Workflow which allows you to run arbitrary workflow code at runtime.
+When you deploy a Workflow, its code is fixed at deploy time. Every Workflow instance runs the same logic. However, if you are building a platform where each customer, agent, or request needs to run _different_ workflow code, you can do so using Workflows with [Dynamic Workers](/dynamic-workers/getting-started/).
+
+For example, you might be building:
+
+- A **SaaS platform** where each customer defines their own onboarding steps.
+- An **AI agent framework** where each agent writes its own durable plan.
+- A **CI/CD system** where each repository defines its own pipeline.
+
+The [`dynamic-workflows`](https://github.com/cloudflare/dynamic-workflows) library lets a single Worker Loader route Workflow execution to any number of Dynamic Workers, so each user's code gets the full power of durable steps (including `step.do()`, `step.sleep()`, `step.waitForEvent()`) without you having to build the routing yourself.
 
 ## Understand the model
 
 This setup has three parts:
 
-- **Loader Worker**: the front door. It receives HTTP requests, knows how to load Dynamic Worker code, and can create Workflow instances.
-- **Workflow class**: the durable orchestrator. It persists state, survives restarts, and executes steps, including steps that pause for days while waiting for human input.
-- **Dynamic Worker**: the user-authored code that defines what the workflow actually does. It is loaded on-demand by script ID.
+- **Worker Loader**: the main Worker you deploy. It receives HTTP requests, decides which user's code to load, and owns the Workflow binding. Think of it as a traffic controller.
+- **Dynamic Worker**: the user-authored code that defines what the workflow actually does. Each user has their own Dynamic Worker, loaded on-demand at runtime by the Worker Loader.
+- **`DynamicWorkflow` class**: the bridge between the two. Created by the library, it tells the Workflows engine which Dynamic Worker to run for each Workflow instance.
 
 ![Dynamic Workers and Workflows architecture diagram](~/assets/images/workflows/dynamic-workflows.png)
 
-## Configure your Worker
+The library provides two functions that handle the connection between these parts:
 
-Your Worker needs a Worker Loader binding and a Workflow binding. The Worker Loader creates Dynamic Workers at runtime, and the Workflow binding points to the durable Workflow class that runs them.
+1. `wrapWorkflowBinding`: creates a Workflow binding you pass to a Dynamic Worker. When the Dynamic Worker calls `create()` on it, the library automatically tags the request with a piece of metadata (for example, a tenant ID) so the engine knows which Dynamic Worker to call back later.
+2. `createDynamicWorkflowEntrypoint`: creates the `DynamicWorkflow` class you register in your config. When the Workflows engine is ready to run a step, this class reads the tag and loads the correct Dynamic Worker.
 
-- A Worker Loader binding
-- A Workflow binding that points to the Workflow class
+## Install the library
+
+The library handles the wiring between the Worker Loader and the Workflows engine, so you do not have to manually tag requests, parse payloads, or write your own `WorkflowEntrypoint` subclass.
+
+<PackageManagers pkg="dynamic-workflows" type="add" />
+
+## Configure your Worker Loader
+
+Your Worker Loader needs two [bindings](/workers/runtime-apis/bindings/):
+
+- A **Worker Loader binding** (`LOADER`) to create Dynamic Workers at runtime. For more information, refer to [Dynamic Worker Loaders](/workers/runtime-apis/bindings/worker-loader/).
+- A **Workflow binding** (`WORKFLOWS`) that points to the `DynamicWorkflow` class the library creates for you.
 
 <WranglerConfig>
 
 ```toml
-name = "dynamic-workflow-loader"
+name = "my-worker-loader"
 main = "src/index.ts"
 compatibility_date = "$today"
 
@@ -39,142 +62,132 @@ binding = "LOADER"
 
 [[workflows]]
 name = "dynamic-workflow"
-binding = "WORKFLOW"
+binding = "WORKFLOWS"
 class_name = "DynamicWorkflow"
 ```
 
 </WranglerConfig>
 
-## Create your Worker entrypoint
+## Create the Worker Loader
 
-Your Worker entrypoint accepts a script, creates a Workflow instance with that script in `params`, and returns the new instance ID. The same entrypoint can also look up the status of an existing Workflow instance.
+The Worker Loader is the main file you write. It has three jobs:
 
-<TypeScriptExample>
+1. **Re-export `DynamicWorkflowBinding`** so the Cloudflare runtime can discover it.
+2. **Load Dynamic Workers** and give each one a wrapped Workflow binding using `wrapWorkflowBinding`. This is what allows each Dynamic Worker to create Workflow instances that are tagged with metadata (like a tenant ID).
+3. **Register the `DynamicWorkflow` class** using `createDynamicWorkflowEntrypoint`. This tells the Workflows engine how to find the right Dynamic Worker when it is time to run a step. You provide a callback (called `loadRunner`) that receives the metadata and returns the Dynamic Worker's workflow class. The library calls this callback every time a Workflow step needs to run.
 
-```ts
-export { DynamicWorkflow } from "./workflow";
+:::note
 
-export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
-		const url = new URL(request.url);
+You must re-export `DynamicWorkflowBinding` from your Worker Loader. The Cloudflare runtime needs this export to build the wrapped binding that Dynamic Workers use. If you forget this line, you will get a runtime error when a Dynamic Worker tries to create a Workflow instance.
 
-		if (url.pathname === "/api/run" && request.method === "POST") {
-			try {
-				const { script } = (await request.json()) as { script: string };
-
-				if (!script || typeof script !== "string") {
-					return Response.json(
-						{ error: "script is required" },
-						{ status: 400 },
-					);
-				}
-
-				const instance = await env.WORKFLOW.create({
-					params: { script },
-				});
-
-				return Response.json({
-					instanceId: instance.id,
-					status: await instance.status(),
-				});
-			} catch (error) {
-				return Response.json(
-					{ error: error instanceof Error ? error.message : String(error) },
-					{ status: 500 },
-				);
-			}
-		}
-
-		if (url.pathname === "/api/status") {
-			const instanceId = url.searchParams.get("instanceId");
-			if (!instanceId) {
-				return Response.json(
-					{ error: "instanceId query param is required" },
-					{ status: 400 },
-				);
-			}
-
-			try {
-				const instance = await env.WORKFLOW.get(instanceId);
-				return Response.json(await instance.status());
-			} catch (error) {
-				return Response.json(
-					{ error: error instanceof Error ? error.message : String(error) },
-					{ status: 500 },
-				);
-			}
-		}
-
-		return new Response("Not Found", { status: 404 });
-	},
-} satisfies ExportedHandler<Env>;
-```
-
-</TypeScriptExample>
-
-## Define the Workflow class
-
-You still deploy one normal Workflow class. Its job is to load the dynamic code for the current run and call it with the `WorkflowStep` object. This is what keeps the [Workflows API](/workflows/build/workers-api/), including `step.do()`, `step.sleep()`, and `step.waitForEvent()`, working as normal.
-
-Use `env.LOADER.get()` via the [Worker Loader API](/dynamic-workers/api-reference/#get) to load the Dynamic Worker for the current Workflow instance. If the loader already has a warm isolate for the same ID, it can reuse it. Otherwise, it calls the callback to create the Worker from the script in the workflow payload.
+:::
 
 <TypeScriptExample>
 
 ```ts
 import {
-	WorkflowEntrypoint,
-	type WorkflowEvent,
-	type WorkflowStep,
-} from "cloudflare:workers";
+	createDynamicWorkflowEntrypoint,
+	DynamicWorkflowBinding,
+	wrapWorkflowBinding,
+	type WorkflowRunner,
+} from "dynamic-workflows";
 
-type Params = {
-	script: string;
-};
+// Required: re-exporting puts the class on cloudflare:workers exports,
+// which is how wrapWorkflowBinding builds per-tenant RPC stubs.
+export { DynamicWorkflowBinding };
 
-export class DynamicWorkflow extends WorkflowEntrypoint<Env, Params> {
-	async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
-		const { script } = event.payload;
-
-		const worker = this.env.LOADER.get(
-			`dyn-wf-${event.instanceId}`,
-			async () => ({
-				mainModule: "index.js",
-				modules: { "index.js": script },
-				compatibilityDate: "2026-04-21",
-				compatibilityFlags: ["nodejs_compat"],
-			}),
-		);
-
-		const entrypoint = worker.getEntrypoint() as unknown as {
-			run(event: Record<string, unknown>, step: WorkflowStep): Promise<unknown>;
-		};
-
-		return await entrypoint.run({}, step);
-	}
+interface Env {
+	WORKFLOWS: Workflow;
+	LOADER: WorkerLoader;
 }
+
+function loadTenant(env: Env, tenantId: string) {
+	return env.LOADER.get(tenantId, async () => ({
+		compatibilityDate: "2026-01-01",
+		mainModule: "index.js",
+		modules: { "index.js": await fetchTenantCode(tenantId) },
+		// The Dynamic Worker uses this exactly like a real Workflow binding;
+		// every create() is tagged with { tenantId } automatically.
+		env: { WORKFLOWS: wrapWorkflowBinding({ tenantId }) },
+	}));
+}
+
+// Register this as class_name in wrangler.jsonc.
+export const DynamicWorkflow = createDynamicWorkflowEntrypoint<Env>(
+	async ({ env, metadata }) => {
+		const stub = loadTenant(env, metadata.tenantId as string);
+		return stub.getEntrypoint("TenantWorkflow") as unknown as WorkflowRunner;
+	},
+);
+
+export default {
+	fetch(request: Request, env: Env) {
+		const tenantId = request.headers.get("x-tenant-id")!;
+		return loadTenant(env, tenantId).getEntrypoint().fetch(request);
+	},
+};
 ```
 
 </TypeScriptExample>
 
-In this example, `event.payload.script` contains the workflow logic to run. The Workflow class loads that code as a Dynamic Worker, gets its entrypoint, and calls `run({}, step)` so the dynamic code can use the same durable step methods as any other Workflow.
+Here is what happens when a request arrives:
+
+1. The `fetch` handler reads the tenant ID from the request header.
+2. `loadTenant` calls `env.LOADER.get()` to load (or reuse) a Dynamic Worker for that tenant. The Dynamic Worker receives `WORKFLOWS: wrapWorkflowBinding({ tenantId })` as a binding, which looks and behaves like a normal Workflow binding.
+3. The request is forwarded to the Dynamic Worker's `fetch` handler.
+
+Later, when the Workflows engine calls `run()` on the `DynamicWorkflow` class, the library reads the `tenantId` back from the saved metadata and calls your `loadRunner` callback. That callback loads the same Dynamic Worker and returns its `TenantWorkflow` class so the engine can execute the workflow steps.
+
+## Write the Dynamic Worker
+
+The Dynamic Worker is the code your user writes. This is the key benefit of the library — the Dynamic Worker is a standard Workflow that uses `step.do()`, `step.sleep()`, and `step.waitForEvent()` as normal. It does not need to know anything about the routing layer. From its perspective, `env.WORKFLOWS` is a regular Workflow binding.
+
+:::caution
+
+Do not put secrets in the metadata you pass to `wrapWorkflowBinding` (for example, API keys or tokens). The Workflows engine persists the metadata in the event payload, and Dynamic Worker code can read it back via `instance.status()`. Use metadata for routing information like tenant IDs, not for sensitive data.
+
+:::
+
+<TypeScriptExample>
+
+```ts
+import { WorkflowEntrypoint } from "cloudflare:workers";
+
+export class TenantWorkflow extends WorkflowEntrypoint {
+	async run(event, step) {
+		return step.do("greet", async () => `Hello, ${event.payload.name}!`);
+	}
+}
+
+export default {
+	async fetch(request, env) {
+		const instance = await env.WORKFLOWS.create({
+			params: await request.json(),
+		});
+		// instance is an RPC stub — .id is an RpcPromise, so await it.
+		return Response.json({ id: await instance.id });
+	},
+};
+```
+
+</TypeScriptExample>
+
+Normal Workflows behavior still applies. Workflow IDs, `.status()`, `.pause()`, retries, hibernation, and durable steps are unaffected by this architecture. The library only adds the routing between the Worker Loader and the Dynamic Worker.
 
 ## Trigger a dynamic workflow
 
-Send a `POST` request to `/api/run` with the workflow code in the `script` field. The response includes an `instanceId` that you can use to check status later.
+Send a `POST` request to the Worker Loader with a tenant ID header and a JSON payload. The Worker Loader loads the matching Dynamic Worker, which calls `env.WORKFLOWS.create()` and returns the new instance ID.
 
 ```bash
-curl -X POST http://localhost:8787/api/run \
-  -H 'Content-Type: application/json' \
-  --data-binary @- <<'EOF'
-{
-  "script": "import { WorkerEntrypoint } from 'cloudflare:workers';\n\nexport default class extends WorkerEntrypoint {\n  async run(event, step) {\n    const result = await step.do('hello', async () => {\n      return { message: 'Hello from API' };\n    });\n\n    return result;\n  }\n}"
-}
-EOF
+curl -X POST http://localhost:8787/ \
+  -H "x-tenant-id: tenant-42" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Alice"}'
 ```
 
 ## Check workflow status
 
-Use the `instanceId` returned from `/api/run` to retrieve the current Workflow status.
+Use the instance ID returned from the previous request to check the Workflow status. For more information on the status API, refer to the [Workers API reference](/workflows/build/workers-api/).
 
 ```bash
 curl "http://localhost:8787/api/status?instanceId=YOUR_INSTANCE_ID"
@@ -182,6 +195,7 @@ curl "http://localhost:8787/api/status?instanceId=YOUR_INSTANCE_ID"
 
 ## Related resources
 
+- [`dynamic-workflows` on GitHub](https://github.com/cloudflare/dynamic-workflows)
 - [Workers API](/workflows/build/workers-api/)
 - [Trigger Workflows](/workflows/build/trigger-workflows/)
 - [Events and parameters](/workflows/build/events-and-parameters/)
